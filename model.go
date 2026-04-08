@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -13,7 +14,7 @@ import (
 // ── styles ────────────────────────────────────────────────────────────────────
 
 var (
-	styleHeader = lipgloss.NewStyle().Bold(true).Padding(0, 1)
+	styleHeader  = lipgloss.NewStyle().Bold(true).Padding(0, 1)
 	styleDivider = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 
 	styleListening  = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))  // bright green
@@ -26,13 +27,14 @@ var (
 	styleInputError  = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 
 	stylePaneTitle = lipgloss.NewStyle().
-		Foreground(lipgloss.Color("240")).
-		PaddingLeft(1)
+			Foreground(lipgloss.Color("240")).
+			PaddingLeft(1)
 )
 
 // ── list item ─────────────────────────────────────────────────────────────────
 
 type forwardItem struct {
+	idx   int
 	spec  ForwardSpec
 	state TunnelState
 	err   error
@@ -62,7 +64,7 @@ func (f forwardItem) Title() string {
 }
 
 func (f forwardItem) Description() string { return "" }
-func (f forwardItem) FilterValue() string  { return f.spec.String() }
+func (f forwardItem) FilterValue() string { return f.spec.String() }
 
 // ── view mode ─────────────────────────────────────────────────────────────────
 
@@ -243,7 +245,7 @@ func (m Model) handleListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, textinput.Blink
 
 	case "d", "delete":
-		idx := m.list.Index()
+		idx := m.selectedSpecIndex()
 		if idx < 0 || idx >= len(m.config.Forwardings) {
 			return m, nil
 		}
@@ -273,7 +275,7 @@ func (m Model) handleListKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "enter", " ":
-		idx := m.list.Index()
+		idx := m.selectedSpecIndex()
 		if idx < 0 || idx >= len(m.config.Forwardings) {
 			return m, nil
 		}
@@ -329,15 +331,31 @@ func (m Model) handleAddInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func (m *Model) rebuildListItems() {
-	items := make([]list.Item, len(m.config.Forwardings))
+	sortedItems := make([]forwardItem, len(m.config.Forwardings))
 	for i, spec := range m.config.Forwardings {
-		items[i] = forwardItem{
+		sortedItems[i] = forwardItem{
+			idx:   i,
 			spec:  spec,
 			state: m.statuses[i],
 			err:   m.errors[i],
 		}
 	}
+	sort.SliceStable(sortedItems, func(i, j int) bool {
+		return sortedItems[i].spec.LocalPort < sortedItems[j].spec.LocalPort
+	})
+	items := make([]list.Item, len(sortedItems))
+	for i, item := range sortedItems {
+		items[i] = item
+	}
 	m.list.SetItems(items)
+}
+
+func (m Model) selectedSpecIndex() int {
+	item, ok := m.list.SelectedItem().(forwardItem)
+	if !ok {
+		return -1
+	}
+	return item.idx
 }
 
 func (m *Model) topPaneHeight() int {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -123,6 +124,7 @@ func LoadConfig(gateway string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return Config{}, err
 	}
+	sortForwardings(cfg.Forwardings)
 	return cfg, nil
 }
 
@@ -131,7 +133,11 @@ func SaveConfig(gateway string, cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	sorted := Config{
+		Forwardings: append([]ForwardSpec(nil), cfg.Forwardings...),
+	}
+	sortForwardings(sorted.Forwardings)
+	data, err := json.MarshalIndent(sorted, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -140,6 +146,12 @@ func SaveConfig(gateway string, cfg Config) error {
 		return err
 	}
 	return os.Rename(tmp, p)
+}
+
+func sortForwardings(forwardings []ForwardSpec) {
+	sort.SliceStable(forwardings, func(i, j int) bool {
+		return forwardings[i].LocalPort < forwardings[j].LocalPort
+	})
 }
 
 // GatewayInfo holds resolved SSH connection details.
