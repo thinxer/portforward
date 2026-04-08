@@ -41,10 +41,11 @@ type Manager struct {
 	gateway GatewayInfo
 	sshCfg  *ssh.ClientConfig
 
-	mu      sync.Mutex
-	client  *ssh.Client // nil when disconnected
-	cancels map[int]context.CancelFunc
-	enabled map[int]ForwardSpec // specs currently running (for restart on reconnect)
+	mu           sync.Mutex
+	client       *ssh.Client // nil when disconnected
+	clientCloser []io.Closer
+	cancels      map[int]context.CancelFunc
+	enabled      map[int]ForwardSpec // specs currently running (for restart on reconnect)
 
 	statusCh chan TunnelStatus
 	connCh   chan ConnEvent
@@ -88,22 +89,32 @@ func NewManager(gw GatewayInfo) (*Manager, error) {
 }
 
 func (m *Manager) StatusCh() <-chan TunnelStatus { return m.statusCh }
-func (m *Manager) ConnCh() <-chan ConnEvent       { return m.connCh }
+func (m *Manager) ConnCh() <-chan ConnEvent      { return m.connCh }
 
 // ensureConnected returns the current ssh.Client, dialing if needed.
 // Caller must NOT hold m.mu.
 func (m *Manager) ensureConnected(ctx context.Context) (*ssh.Client, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.client != nil {
-		return m.client, nil
+		client := m.client
+		m.mu.Unlock()
+		return client, nil
 	}
-	addr := net.JoinHostPort(m.gateway.Host, m.gateway.Port)
-	c, err := ssh.Dial("tcp", addr, m.sshCfg)
+	m.mu.Unlock()
+
+	c, closers, err := m.dialGateway(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.client != nil {
+		closeAll(closers)
+		return m.client, nil
+	}
 	m.client = c
+	m.clientCloser = closers
 	return c, nil
 }
 
@@ -126,8 +137,7 @@ func (m *Manager) keepaliveLoop() {
 			if err != nil {
 				m.mu.Lock()
 				if m.client == c { // still the same client
-					c.Close()
-					m.client = nil
+					m.closeClientLocked()
 				}
 				m.mu.Unlock()
 				m.restartAllEnabled()
@@ -195,10 +205,7 @@ func (m *Manager) restartAllEnabled() {
 func (m *Manager) Shutdown() {
 	m.rootCancel()
 	m.mu.Lock()
-	if m.client != nil {
-		m.client.Close()
-		m.client = nil
-	}
+	m.closeClientLocked()
 	m.mu.Unlock()
 }
 
@@ -306,5 +313,73 @@ func (m *Manager) send(s TunnelStatus) {
 	select {
 	case m.statusCh <- s:
 	default:
+	}
+}
+
+func (m *Manager) dialGateway(_ context.Context) (*ssh.Client, []io.Closer, error) {
+	path := append([]SSHHost(nil), m.gateway.Jumps...)
+	path = append(path, SSHHost{
+		Alias: m.gateway.Alias,
+		Host:  m.gateway.Host,
+		User:  m.gateway.User,
+		Port:  m.gateway.Port,
+	})
+
+	var (
+		client  *ssh.Client
+		closers []io.Closer
+	)
+
+	for i, host := range path {
+		addr := net.JoinHostPort(host.Host, host.Port)
+		cfg := m.sshConfig(host.User)
+
+		if i == 0 {
+			next, err := ssh.Dial("tcp", addr, cfg)
+			if err != nil {
+				return nil, nil, fmt.Errorf("connect to %s: %w", host.Alias, err)
+			}
+			client = next
+			closers = append(closers, next)
+			continue
+		}
+
+		conn, err := client.Dial("tcp", addr)
+		if err != nil {
+			closeAll(closers)
+			return nil, nil, fmt.Errorf("connect to %s via jump host: %w", host.Alias, err)
+		}
+
+		cc, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
+		if err != nil {
+			_ = conn.Close()
+			closeAll(closers)
+			return nil, nil, fmt.Errorf("ssh handshake with %s: %w", host.Alias, err)
+		}
+
+		next := ssh.NewClient(cc, chans, reqs)
+		client = next
+		closers = append(closers, next)
+	}
+
+	return client, closers, nil
+}
+
+func (m *Manager) sshConfig(user string) *ssh.ClientConfig {
+	cfg := *m.sshCfg
+	cfg.User = user
+	return &cfg
+}
+
+func (m *Manager) closeClientLocked() {
+	m.client = nil
+	closers := m.clientCloser
+	m.clientCloser = nil
+	closeAll(closers)
+}
+
+func closeAll(closers []io.Closer) {
+	for i := len(closers) - 1; i >= 0; i-- {
+		_ = closers[i].Close()
 	}
 }

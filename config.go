@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -160,29 +162,261 @@ type GatewayInfo struct {
 	Host  string
 	User  string
 	Port  string
+	Jumps []SSHHost
+}
+
+type SSHHost struct {
+	Alias string
+	Host  string
+	User  string
+	Port  string
+}
+
+type jumpSpec struct {
+	ref  string
+	user string
+	port string
 }
 
 // ResolveGateway resolves an SSH alias via ~/.ssh/config.
-func ResolveGateway(alias string) (GatewayInfo, error) {
-	host, _ := ssh_config.GetStrict(alias, "Hostname")
-	if host == "" {
-		host = alias
+func ResolveGateway(alias, proxyJumpOverride string) (GatewayInfo, error) {
+	target, err := resolveSSHHost(alias, "", "")
+	if err != nil {
+		return GatewayInfo{}, err
 	}
-	user, _ := ssh_config.GetStrict(alias, "User")
-	if user == "" {
-		user = os.Getenv("USER")
-		if user == "" {
-			user = os.Getenv("LOGNAME")
+
+	jumpSpec := proxyJumpOverride
+	if jumpSpec == "" {
+		jumpSpec, err = ssh_config.GetStrict(alias, "ProxyJump")
+		if err != nil {
+			return GatewayInfo{}, err
 		}
 	}
-	port, _ := ssh_config.GetStrict(alias, "Port")
+
+	jumps, err := resolveProxyJumpSpec(jumpSpec, map[string]bool{})
+	if err != nil {
+		return GatewayInfo{}, err
+	}
+
+	return GatewayInfo{
+		Alias: target.Alias,
+		Host:  target.Host,
+		User:  target.User,
+		Port:  target.Port,
+		Jumps: jumps,
+	}, nil
+}
+
+func resolveSSHHost(ref, userOverride, portOverride string) (SSHHost, error) {
+	host, err := ssh_config.GetStrict(ref, "Hostname")
+	if err != nil {
+		return SSHHost{}, err
+	}
+	if host == "" {
+		host = ref
+	}
+
+	user, err := ssh_config.GetStrict(ref, "User")
+	if err != nil {
+		return SSHHost{}, err
+	}
+	if user == "" {
+		user = defaultSSHUser()
+	}
+	if userOverride != "" {
+		user = userOverride
+	}
+	if user == "" {
+		return SSHHost{}, fmt.Errorf("user not configured for %q", ref)
+	}
+
+	port, err := ssh_config.GetStrict(ref, "Port")
+	if err != nil {
+		return SSHHost{}, err
+	}
 	if port == "" {
 		port = "22"
 	}
-	return GatewayInfo{
-		Alias: alias,
+	if portOverride != "" {
+		port = portOverride
+	}
+	if err := validatePort(port); err != nil {
+		return SSHHost{}, fmt.Errorf("invalid port for %q: %w", ref, err)
+	}
+
+	return SSHHost{
+		Alias: ref,
 		Host:  host,
 		User:  user,
 		Port:  port,
 	}, nil
+}
+
+func resolveProxyJumpSpec(spec string, seen map[string]bool) ([]SSHHost, error) {
+	jumps, err := parseProxyJumpSpec(spec)
+	if err != nil || len(jumps) == 0 {
+		return nil, err
+	}
+
+	resolved := make([]SSHHost, 0, len(jumps))
+	for _, jump := range jumps {
+		nested, err := resolveConfiguredProxyJumps(jump.ref, seen)
+		if err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, nested...)
+
+		host, err := resolveSSHHost(jump.ref, jump.user, jump.port)
+		if err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, host)
+	}
+	return resolved, nil
+}
+
+func resolveConfiguredProxyJumps(alias string, seen map[string]bool) ([]SSHHost, error) {
+	key := strings.ToLower(alias)
+	if seen[key] {
+		return nil, fmt.Errorf("ProxyJump cycle detected at %q", alias)
+	}
+
+	seen[key] = true
+	defer delete(seen, key)
+
+	spec, err := ssh_config.GetStrict(alias, "ProxyJump")
+	if err != nil {
+		return nil, err
+	}
+	return resolveProxyJumpSpec(spec, seen)
+}
+
+func parseProxyJumpSpec(spec string) ([]jumpSpec, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" || strings.EqualFold(spec, "none") {
+		return nil, nil
+	}
+
+	parts := strings.Split(spec, ",")
+	jumps := make([]jumpSpec, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("invalid ProxyJump %q", spec)
+		}
+		if strings.EqualFold(part, "none") {
+			return nil, fmt.Errorf("invalid ProxyJump %q", spec)
+		}
+
+		jump, err := parseJumpEndpoint(part)
+		if err != nil {
+			return nil, err
+		}
+		jumps = append(jumps, jump)
+	}
+	return jumps, nil
+}
+
+func parseJumpEndpoint(s string) (jumpSpec, error) {
+	if strings.HasPrefix(s, "ssh://") {
+		return parseJumpURI(s)
+	}
+
+	var jump jumpSpec
+	hostSpec := s
+	if at := strings.LastIndex(s, "@"); at >= 0 {
+		jump.user = s[:at]
+		hostSpec = s[at+1:]
+		if jump.user == "" {
+			return jumpSpec{}, fmt.Errorf("invalid jump host %q", s)
+		}
+	}
+
+	host, port, err := splitJumpHostPort(hostSpec)
+	if err != nil {
+		return jumpSpec{}, err
+	}
+	if host == "" {
+		return jumpSpec{}, fmt.Errorf("invalid jump host %q", s)
+	}
+
+	jump.ref = host
+	jump.port = port
+	return jump, nil
+}
+
+func parseJumpURI(s string) (jumpSpec, error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return jumpSpec{}, fmt.Errorf("invalid jump host %q: %w", s, err)
+	}
+	if u.Scheme != "ssh" {
+		return jumpSpec{}, fmt.Errorf("invalid jump host %q", s)
+	}
+	if u.Hostname() == "" {
+		return jumpSpec{}, fmt.Errorf("invalid jump host %q", s)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return jumpSpec{}, fmt.Errorf("invalid jump host %q", s)
+	}
+
+	return jumpSpec{
+		ref:  u.Hostname(),
+		user: u.User.Username(),
+		port: u.Port(),
+	}, nil
+}
+
+func splitJumpHostPort(s string) (string, string, error) {
+	if s == "" {
+		return "", "", fmt.Errorf("invalid jump host %q", s)
+	}
+
+	if strings.HasPrefix(s, "[") {
+		if strings.Contains(s, "]:") {
+			host, port, err := net.SplitHostPort(s)
+			if err != nil {
+				return "", "", fmt.Errorf("invalid jump host %q", s)
+			}
+			return host, port, nil
+		}
+		if strings.HasSuffix(s, "]") {
+			return strings.TrimSuffix(strings.TrimPrefix(s, "["), "]"), "", nil
+		}
+		return "", "", fmt.Errorf("invalid jump host %q", s)
+	}
+
+	colons := strings.Count(s, ":")
+	switch {
+	case colons == 0:
+		return s, "", nil
+	case colons == 1:
+		idx := strings.LastIndex(s, ":")
+		host := s[:idx]
+		port := s[idx+1:]
+		if host == "" || port == "" {
+			return "", "", fmt.Errorf("invalid jump host %q", s)
+		}
+		if err := validatePort(port); err != nil {
+			return "", "", fmt.Errorf("invalid jump host %q", s)
+		}
+		return host, port, nil
+	default:
+		return "", "", fmt.Errorf("invalid jump host %q: bracket IPv6 addresses", s)
+	}
+}
+
+func defaultSSHUser() string {
+	if user := os.Getenv("USER"); user != "" {
+		return user
+	}
+	return os.Getenv("LOGNAME")
+}
+
+func validatePort(port string) error {
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("port %q must be between 1 and 65535", port)
+	}
+	return nil
 }
